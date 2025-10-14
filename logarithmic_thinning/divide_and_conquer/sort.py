@@ -32,8 +32,8 @@ def process_chunk(args):
     # Flatten `pp` values and generate associated data
     combined_pp = chunk_data[log10p_columns].values.flatten(order='F').astype(np.float32)
     row_indices = np.tile(np.arange(start_row, start_row + n_rows, dtype=np.int32), n_cols)
-    chr_values = np.repeat(chunk_data['chr'].values.astype(np.int8), n_cols)
-    pos_values = np.repeat(chunk_data['pos'].values.astype(np.int32), n_cols)
+    chr_values = np.tile(chunk_data['chr'].values.astype(np.int8), n_cols)
+    pos_values = np.tile(chunk_data['pos'].values.astype(np.int32), n_cols)
     
     # Delate chunk data, making enabling memory release
     del chunk_data
