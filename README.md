@@ -103,7 +103,7 @@ Generated artefacts under `$OUTPUT/slurm/`:
 - `logs/` — per-job stdout/stderr (`sort-<jobid>_<task>.{out,err}`, etc.)
 
 Defaults: `--account=<account>`, `--partition=urblauna`,
-sort 8 CPUs / 100G / 2h, merge 4 CPUs / 200G / 2h, thin 1 CPU / 100G / 1h. Edit
+sort 8 CPUs / 200G / 2h, merge 2 CPUs / 400G / 2h, thin 1 CPU / 100G / 1h. Edit
 the `SBATCH_*` variables at the top of `run_pipeline_slurm.sh` to override.
 
 The driver checks that all input files share the same `col_pattern` columns
