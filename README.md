@@ -1,82 +1,154 @@
-
 # Logarithmic Thinning for the RETFound Project
 
-This pipeline applies logarithmic thinning to GWAS p-values, starting from BGenie output files. The process is optimized for SLURM clusters and is designed to efficiently reduce the number of p-values for downstream analysis, while keeping the most significant results and a representative sample of less significant ones.
+Logarithmic thinning of GWAS p-values from BGenie per-chromosome outputs. Keeps
+every most-significant SNP and a geometric sample of the rest, so a single
+manageable file can drive Manhattan / QQ plots without losing the top of the
+distribution.
 
-## Steps
+## Quick start
 
-1. **Sort the per-chromosome files, keeping only rows above a p-value threshold**
-    - Configure `divide_and_conquer/sort_job.sh` with the input folder (`INPUT_FOLDER`), desired chunk size, delimiter, and the columns you want to keep.  
-      You can now identify the -log10 columns explicitly via `--pp-columns` or let the sorter convert raw p-values with `--p-columns`.
-    - Example (single chromosome, interactive run):
-      ```bash
-      python divide_and_conquer/sort.py /path/to/chr01.txt \
-        --shared_dir /tmp/chr01_chunks \
-        --pp-columns trait_true-log10p \
-        --pp-threshold 0 \
-        --chunksize 5000000
-      ```
-    - To scan a batch on SLURM:
-      ```bash
-      for CHROM in {1..22}; do
-        sbatch sort_job.sh $CHROM
-      done
-      ```
-      where `sort_job.sh` forwards the relevant CLI arguments.
+```bash
+./run_pipeline.sh <bgenie_dir> <out_dir> \
+                  [thinning_factor=1.0003] \
+                  [glob='*'] \
+                  [chunksize=500000] \
+                  [col_pattern='-log10p$']
+```
 
-2. **Merge-sort the chromosome-wise lists**
-	 - After sorting, merge all chromosome results into a single sorted file:
-		 ```bash
-		 python divide_and_conquer/pmerge_sort.py --input_dir /path/to/true_sorted_chunks_pp2 --output_dir .
-		 ```
+Three stages chained:
 
-3. **Apply logarithmic thinning**
-	 - From the root project directory, run:
-		 ```bash
-		 python thin_sorted_pvalues.py divide_and_conquer/final_sorted_data.csv \
-		   --thinning-factor 1.0003 --method python
-		 ```
-	 - If you also want the retained row indices in a separate file:
-		 ```bash
-		 python thin_sorted_pvalues_with_rows.py divide_and_conquer/final_sorted_data.csv \
-		   --thinning-factor 1.0003 --method python
-		 ```
-	 - Output will appear in the `divide_and_conquer` sub-directory. Rename the output file for uniqueness if needed.
+1. **sort** — for every input file matching `<bgenie_dir>/<glob>`, derives the
+   list of phenotype columns from the header (every column name matching
+   `col_pattern`, default = every `-log10p` column) and passes it to
+   `divide_and_conquer/sort.py` as `--pp-columns`. Sorted `.npz` chunks land in
+   `<out_dir>/chunks/`.
+2. **merge** — `pmerge_sort.py` merges every chunk into
+   `<out_dir>/final_sorted_data.csv` (plus a binary `.npy`).
+3. **thin** — `thin_sorted_pvalues.py --thinning-factor F --method python`
+   writes `<out_dir>/thinned_final_sorted_data.csv`.
 
-## C++ Accelerated Tools
+Input assumptions (BGenie defaults):
 
-For larger workloads you can use the C++ implementations that mirror the Python pipeline:
+- space-delimited
+- header contains `chr` and `pos` columns
+- one or more columns matching `col_pattern` (defaults to every `-log10p`
+  column, i.e. values already on the −log10 scale)
+- plain text or `.gz` — handled transparently
 
-- Build the executables once:
-  ```bash
-  make -C cpp
-  ```
-- Run the sorter (chunk rows defaults to 1,000,000):
-  ```bash
-  cpp/build/logsort --input path/to/bgenie_output.txt --output final_sorted_data.csv --threshold 0 --chunk-rows 2000000
-  ```
-  Temporary chunk files are written next to the output unless `--tmpdir` is provided.
-- Apply thinning on the sorted CSV:
-  ```bash
-  cpp/build/logthin --input final_sorted_data.csv --output thinned_final_sorted_data.csv --factor 1.0003
-  ```
+Restricting the set of columns:
 
-The C++ sorter also emits a binary stream (`final_sorted_data.bin`) that contains the sorted records in the order written to the CSV for downstream tooling.
+| `col_pattern`                | thinned columns                |
+| ---------------------------- | ------------------------------ |
+| `-log10p$` *(default)*       | every `-log10p` column         |
+| `_true-log10p$`              | only measured-trait columns    |
+| `LV_.*-log10p$`              | only LV columns                |
+| `(LV_.*\|.*_true)-log10p$`   | LVs + measured                 |
 
-## Final Output
+Memory of the sort step scales roughly as `chunksize × n_phenotypes × 4 bytes`.
+For ~1000 phenotypes, `chunksize=500000` keeps it around 2 GB resident; halve
+it if you OOM.
 
-The final output is a CSV file (e.g., `thinned_python_final_sorted_data.csv`) containing the thinned, sorted p-values. This file is suitable for downstream analysis and visualization (e.g., Manhattan plots).
+## Running on Urblauna (left-eye May-2026 revision)
 
-### Output Columns
+The BGenie outputs for the May-2026 left-eye revision live at:
 
-- `chr`: Chromosome number
-- `pos`: Genomic position
-- `pp`: The -log10(p-value) (higher values are more significant)
-- `original_index`: The original row index from the merged file
-- `unthinned_rank`: Position within the *unthinned* sorted list (1-based)
+```
+/scratch/<user>/retina/GWAS/output/RunGWAS/2026_05_26_left_eye_mTIFs_dTIFs_LVs_for_revisions
+```
 
-#### What is `pp`?
-`pp` stands for the -log10(p-value) as output by BGenie. A higher `pp` means a more significant association (e.g., `pp=8` means p-value = 1e-8).
+Each chromosome file is space-delimited and carries **1058 `*-log10p` phenotype
+columns**: 17 measured TIFs (`*_true-log10p`), 17 deep-TIFs (`*_pred-log10p`),
+and 1024 LVs (`LV_*-log10p`). To thin all of them in one go:
 
----
-This workflow ensures you keep the most significant GWAS hits and a representative sample of less significant ones, while making the data manageable for further analysis.
+```bash
+# clone once on Urblauna
+git clone git@github.com:BergmannLab/logarithmic-thinning.git ~/logarithmic-thinning
+cd ~/logarithmic-thinning
+
+# run the pipeline
+INPUT=/scratch/<user>/retina/GWAS/output/RunGWAS/2026_05_26_left_eye_mTIFs_dTIFs_LVs_for_revisions
+OUTPUT=/scratch/<user>/retina/GWAS/output/logthin_left_eye_2026_05_26
+
+./run_pipeline.sh "$INPUT" "$OUTPUT" 1.0003 'chr*' 500000
+```
+
+The default `col_pattern` picks up every `-log10p` column, so this thins all
+1058 phenotypes. To restrict to the 17 measured TIFs only, append a 6th
+argument: `'_true-log10p$'`.
+
+Wrap the call in `sbatch` on a node with **≥8 GB RAM**; the sort step is serial
+across the 22 chromosome files, so wall-time is roughly
+`22 × (sort-per-file) + merge + thin`. Outputs:
+
+- `$OUTPUT/chunks/` — sorted `.npz` chunks (intermediate; can be deleted after)
+- `$OUTPUT/final_sorted_data.csv` (+ `.npy`) — fully sorted, untrimmed
+- `$OUTPUT/thinned_final_sorted_data.csv` — the final thinned table
+
+## Output schema
+
+`thinned_final_sorted_data.csv` columns:
+
+- `chr` — chromosome
+- `pos` — genomic position
+- `pp` — `-log10(p-value)` (higher = more significant; `pp=8` ⇔ p=1e-8)
+- `original_index` — row index in the merged sorted file
+- `unthinned_rank` — 1-based position in the *unthinned* sorted list
+
+`thin_sorted_pvalues_with_rows.py` is a drop-in replacement that also writes
+the retained row indices to a separate file.
+
+## Manual (per-stage) invocation
+
+Each stage can be run on its own for tighter control or SLURM-style
+parallelisation of the sort across chromosomes:
+
+```bash
+# 1. sort one chromosome (repeat for chr02…chr22 with the SAME --shared_dir)
+python divide_and_conquer/sort.py /path/to/chr01.txt \
+  --shared_dir /tmp/sorted_chunks \
+  --pp-columns trait1_true-log10p,trait2_true-log10p \
+  --pp-threshold 0 \
+  --chunksize 500000
+
+# 2. merge all chunks into one sorted file
+python divide_and_conquer/pmerge_sort.py \
+  --input_dir /tmp/sorted_chunks --output_dir /tmp/sort_out
+
+# 3. apply logarithmic thinning
+python thin_sorted_pvalues.py /tmp/sort_out/final_sorted_data.csv \
+  --thinning-factor 1.0003 --method python \
+  --output /tmp/sort_out/thinned_final_sorted_data.csv
+```
+
+For SLURM-parallel sorting, `divide_and_conquer/sort_job.sh` runs the sort step
+per chromosome — forward your `--pp-columns` / `--pp-threshold` / `--chunksize`
+flags. Use `--p-columns` (instead of `--pp-columns`) if your inputs hold raw
+p-values rather than `-log10p`.
+
+## C++ accelerated tools
+
+Optional faster drop-ins for very large inputs. Build once:
+
+```bash
+make -C cpp
+```
+
+Sort one file:
+
+```bash
+cpp/build/logsort --input /path/to/bgenie_output.txt \
+  --output final_sorted_data.csv --threshold 0 --chunk-rows 2000000
+```
+
+Apply thinning:
+
+```bash
+cpp/build/logthin --input final_sorted_data.csv \
+  --output thinned_final_sorted_data.csv --factor 1.0003
+```
+
+The C++ sorter also emits a binary stream (`final_sorted_data.bin`) for
+downstream tooling. It processes a single input file, so for multi-chromosome
+runs either use the Python `run_pipeline.sh` (which handles cross-file merging
+through the chunks dir) or run `logsort` per chromosome and merge the outputs
+yourself.

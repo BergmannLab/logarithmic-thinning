@@ -1,35 +1,95 @@
 #!/usr/bin/env bash
-# Full logarithmic-thinning pipeline from raw BGENIE per-chromosome outputs.
+# Full logarithmic-thinning pipeline from raw BGenie per-chromosome outputs.
 #
-#   ./run_pipeline.sh <bgenie_dir> <out_dir> [thinning_factor] [glob]
+# Usage:
+#   ./run_pipeline.sh <bgenie_dir> <out_dir> \
+#                     [thinning_factor=1.0003] \
+#                     [glob='*'] \
+#                     [chunksize=500000] \
+#                     [col_pattern='-log10p$']
 #
-# <bgenie_dir>      directory of raw BGENIE files (one per chromosome)
-# <out_dir>         where chunks + final/thinned CSVs are written
-# [thinning_factor] default 1.0003
-# [glob]            filename pattern within <bgenie_dir>, default '*' (e.g. 'chr*.txt')
+# Behaviour:
+#   - For each input file matching <bgenie_dir>/<glob>, derives the list of
+#     phenotype columns from the header (every column name matching
+#     <col_pattern>, default = every '-log10p' column) and passes it to
+#     divide_and_conquer/sort.py as --pp-columns. The sort step writes
+#     sorted .npz chunks into <out_dir>/chunks/.
+#   - pmerge_sort.py then merges every chunk into <out_dir>/final_sorted_data.csv
+#     (plus a binary .npy).
+#   - thin_sorted_pvalues.py applies logarithmic thinning, writing
+#     <out_dir>/thinned_final_sorted_data.csv.
 #
-# Assumes BGENIE defaults: space-delimited, with `chr`/`pos` columns and one or
-# more `*true-log10p` columns (auto-detected). Override in the sort step if not.
+# Notes:
+#   - Inputs are assumed space-delimited with `chr`/`pos` columns and one or
+#     more `-log10p` columns already on the -log10 scale.
+#   - Plain-text and gzipped (.gz) inputs are both supported; the header is
+#     read with zcat for .gz files, and pandas reads .gz natively.
+#   - <out_dir>/chunks must not exist (or must be empty); the script refuses
+#     to merge into a chunk dir that already has data, to avoid silently
+#     mixing runs.
+#   - Memory of the sort step scales roughly as
+#         chunksize x n_phenotypes x 4 bytes
+#     For ~1000 phenotypes and chunksize=500000 that is ~2 GB just for the
+#     pp matrix, plus pandas overhead. Lower chunksize for wider inputs.
+#   - To restrict the set of thinned columns, pass an extended-regex as the
+#     6th argument, e.g.:
+#         '_true-log10p$'             only measured-trait columns
+#         'LV_.*-log10p$'             only the LV columns
+#         '(LV_.*|.*_true)-log10p$'   LV + measured
 set -euo pipefail
 
 IN="${1:?bgenie input dir}"
 OUT="${2:?output dir}"
 FACTOR="${3:-1.0003}"
 GLOB="${4:-*}"
+CHUNK="${5:-500000}"
+PATTERN="${6:-}"
+[ -z "$PATTERN" ] && PATTERN='-log10p$'
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CHUNKS="$OUT/chunks"
+
+[ -d "$IN" ] || { echo "ERROR: input dir does not exist: $IN" >&2; exit 1; }
+if [ -d "$CHUNKS" ] && [ -n "$(ls -A "$CHUNKS" 2>/dev/null)" ]; then
+  echo "ERROR: $CHUNKS already exists and is non-empty." >&2
+  echo "Remove it (rm -rf '$CHUNKS') or choose a different <out_dir>." >&2
+  exit 1
+fi
 mkdir -p "$CHUNKS"
 
-# 1) sort each chromosome into a shared chunk dir (chunks accumulate across files)
-for f in "$IN"/$GLOB; do
-  echo "[sort] $f"
+read_header() {
+  case "$1" in
+    *.gz) zcat "$1" | head -1 ;;
+    *)    head -1 "$1" ;;
+  esac
+}
+
+shopt -s nullglob
+files=("$IN"/$GLOB)
+shopt -u nullglob
+if [ "${#files[@]}" -eq 0 ]; then
+  echo "ERROR: no files match $IN/$GLOB" >&2; exit 1
+fi
+
+# 1) sort each chromosome into the shared chunk dir
+for f in "${files[@]}"; do
+  COLS=$(read_header "$f" | tr ' \t' '\n\n' | grep -E "$PATTERN" | paste -sd,)
+  if [ -z "$COLS" ]; then
+    echo "ERROR: no header column matches /$PATTERN/ in $f" >&2; exit 1
+  fi
+  N=$(echo "$COLS" | tr ',' '\n' | wc -l)
+  echo "[sort] $f  ($N phenotypes, chunksize=$CHUNK)"
   python "$HERE/divide_and_conquer/sort.py" "$f" \
-    --shared_dir "$CHUNKS" --auto-detect --pp-threshold 0
+    --shared_dir "$CHUNKS" \
+    --pp-columns "$COLS" \
+    --pp-threshold 0 \
+    --chunksize "$CHUNK"
 done
 
 # 2) merge all chunks -> $OUT/final_sorted_data.csv (+ .npy)
 echo "[merge]"
-python "$HERE/divide_and_conquer/pmerge_sort.py" --input_dir "$CHUNKS" --output_dir "$OUT"
+python "$HERE/divide_and_conquer/pmerge_sort.py" \
+  --input_dir "$CHUNKS" --output_dir "$OUT"
 
 # 3) logarithmic thinning -> $OUT/thinned_final_sorted_data.csv
 echo "[thin]"
