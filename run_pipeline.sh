@@ -73,7 +73,7 @@ fi
 
 # 1) sort each chromosome into the shared chunk dir
 for f in "${files[@]}"; do
-  COLS=$(read_header "$f" | tr ' \t' '\n\n' | grep -E "$PATTERN" | paste -sd,)
+  COLS=$(read_header "$f" | tr ' \t' '\n\n' | grep -E -e "$PATTERN" | paste -sd,)
   if [ -z "$COLS" ]; then
     echo "ERROR: no header column matches /$PATTERN/ in $f" >&2; exit 1
   fi
