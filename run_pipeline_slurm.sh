@@ -23,10 +23,13 @@
 #   final_sorted_data.csv     -- merge output
 #   thinned_final_sorted_data.csv  -- thin output
 #
-# Resources default to the values used by the existing repo artifacts:
-#   sort  : 8 CPUs, 100G, 2h, partition=urblauna, account=<account>
+# Resources default to:
+#   sort  : 8 CPUs, 200G, 2h, partition=urblauna, account=<account>
 #   merge : 4 CPUs, 200G, 2h
 #   thin  : 1 CPU,  100G, 1h
+# Sort memory is generous because each worker pickles its full chunk
+# DataFrame (~5 GB for 500k rows × 1000 phenos × float32) and we may have
+# 3+ workers running in parallel on the largest chromosomes.
 # Edit the SBATCH_* variables below to change them.
 set -euo pipefail
 
@@ -122,7 +125,7 @@ cat > "$SORT_SBATCH" <<EOF
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=100G
+#SBATCH --mem=200G
 #SBATCH --time=02:00:00
 set -euo pipefail
 $SBATCH_MODULES
@@ -135,7 +138,8 @@ python "$HERE/sort_merge/sort.py" "\$FILE" \\
   --shared_dir "$CHUNKS" \\
   --pp-columns "\$COLS" \\
   --pp-threshold 0 \\
-  --chunksize $CHUNK
+  --chunksize $CHUNK \\
+  --workers \$SLURM_CPUS_PER_TASK
 EOF
 
 MERGE_SBATCH="$SLURM_DIR/merge.sbatch"

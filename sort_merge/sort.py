@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from typing import Iterable, List, Sequence
 
 import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, as_completed, BrokenExecutor
+
 import numpy as np
 import pandas as pd
 
@@ -86,6 +88,15 @@ def parse_arguments() -> argparse.Namespace:
         "--auto-detect",
         action="store_true",
         help="Auto-detect columns ending with 'true-log10p' when --pp-columns is omitted.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help=(
+            "Number of worker processes for parallel chunk processing. "
+            "Defaults to min(8, $SLURM_CPUS_PER_TASK or os.sched_getaffinity)."
+        ),
     )
     return parser.parse_args()
 
@@ -209,8 +220,21 @@ def main() -> None:
         sys.exit(1)
 
     os.makedirs(args.shared_dir, exist_ok=True)
-    num_cpus = mp.cpu_count()
-    print(f"Using {num_cpus} CPUs.", flush=True)
+
+    if args.workers is not None:
+        n_workers = max(1, args.workers)
+    else:
+        slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
+        if slurm_cpus:
+            cpu_budget = int(slurm_cpus)
+        else:
+            try:
+                cpu_budget = len(os.sched_getaffinity(0))
+            except AttributeError:
+                cpu_budget = mp.cpu_count()
+        n_workers = max(1, min(8, cpu_budget))
+
+    print(f"Using up to {n_workers} worker processes.", flush=True)
     print(f"Input file: {args.input_file}", flush=True)
 
     requested_columns: List[str] = [
@@ -245,21 +269,30 @@ def main() -> None:
         threshold=float(args.pp_threshold),
     )
 
-    pool = mp.Pool(processes=num_cpus)
-    start_row = 0
-    pending = []
+    # ProcessPoolExecutor.as_completed raises BrokenProcessPool when a child
+    # is killed (e.g. OOM-killer), instead of deadlocking like mp.Pool.join().
+    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+        futures = []
+        start_row = 0
+        for chunk in reader:
+            print(f"Processing chunk starting at row {start_row}", flush=True)
+            futures.append(
+                executor.submit(process_chunk, (chunk, start_row, config))
+            )
+            start_row += len(chunk)
 
-    for chunk in reader:
-        print(f"Processing chunk starting at row {start_row}", flush=True)
-        r = pool.apply_async(process_chunk, args=((chunk, start_row, config),))
-        pending.append(r)
-        start_row += len(chunk)
-
-    pool.close()
-    pool.join()
-
-    for r in pending:
-        r.get()  # raises WorkerLostError / exception if a worker was killed
+        try:
+            for fut in as_completed(futures):
+                fut.result()
+        except BrokenExecutor as exc:
+            print(
+                "ERROR: a worker died unexpectedly (likely OOM-killed). "
+                "Re-run with more --mem or a smaller --chunksize. "
+                f"({type(exc).__name__}: {exc})",
+                file=sys.stderr,
+                flush=True,
+            )
+            raise
 
     print("All chunks have been processed and saved.", flush=True)
 
