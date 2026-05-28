@@ -25,7 +25,7 @@
 #
 # Resources default to:
 #   sort  : 8 CPUs, 200G, 2h, partition=urblauna, account=<account>
-#   merge : 2 CPUs, 400G, 2h
+#   merge : 2 CPUs, 400G, 6h
 #   thin  : 1 CPU,  100G, 1h
 # Sort memory is generous because each worker pickles its full chunk
 # DataFrame (~5 GB for 500k rows × 1000 phenos × float32) and we may have
@@ -154,7 +154,7 @@ cat > "$MERGE_SBATCH" <<EOF
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=400G
-#SBATCH --time=02:00:00
+#SBATCH --time=06:00:00
 set -euo pipefail
 $SBATCH_MODULES
 
