@@ -69,7 +69,7 @@ cd ~/logarithmic-thinning
 INPUT=/scratch/<user>/retina/GWAS/output/RunGWAS/2026_05_26_left_eye_mTIFs_dTIFs_LVs_for_revisions
 OUTPUT=/scratch/<user>/retina/GWAS/output/logthin_left_eye_2026_05_26
 
-./run_pipeline.sh "$INPUT" "$OUTPUT" 1.0003 'chr*' 500000
+./run_pipeline.sh "$INPUT" "$OUTPUT" 1.0003 'output_ukb_imp_chr*_v3.txt' 500000
 ```
 
 The default `col_pattern` picks up every `-log10p` column, so this thins all
