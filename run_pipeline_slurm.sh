@@ -161,7 +161,8 @@ $SBATCH_MODULES
 echo "[\$(date -Is)] merge starting"
 python "$HERE/sort_merge/pmerge_sort.py" \\
   --input_dir "$CHUNKS" \\
-  --output_dir "$OUT"
+  --output_dir "$OUT" \\
+  --workers \$SLURM_CPUS_PER_TASK
 EOF
 
 THIN_SBATCH="$SLURM_DIR/thin.sbatch"
