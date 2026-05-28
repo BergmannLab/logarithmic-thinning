@@ -6,8 +6,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 import pandas as pd
 
-from divide_and_conquer import sort as sorter
-from divide_and_conquer import pmerge_sort as merger
+from sort_merge import sort as sorter
+from sort_merge import pmerge_sort as merger
 from thin_sorted_pvalues import logarithmic_thinning
 
 

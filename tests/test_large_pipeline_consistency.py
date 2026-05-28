@@ -153,8 +153,8 @@ def run_python_pipeline(chromosomes, tmpdir, threshold):
     output_dir = Path(tmpdir) / "python_output"
     output_dir.mkdir()
 
-    sort_script = REPO_ROOT / "divide_and_conquer" / "sort.py"
-    merge_script = REPO_ROOT / "divide_and_conquer" / "pmerge_sort.py"
+    sort_script = REPO_ROOT / "sort_merge" / "sort.py"
+    merge_script = REPO_ROOT / "sort_merge" / "pmerge_sort.py"
 
     combined_path = Path(tmpdir) / "python_all_chromosomes.txt"
     write_combined_bgenie(combined_path, chromosomes)

@@ -247,14 +247,19 @@ def main() -> None:
 
     pool = mp.Pool(processes=num_cpus)
     start_row = 0
+    pending = []
 
     for chunk in reader:
         print(f"Processing chunk starting at row {start_row}", flush=True)
-        pool.apply_async(process_chunk, args=((chunk, start_row, config),))
+        r = pool.apply_async(process_chunk, args=((chunk, start_row, config),))
+        pending.append(r)
         start_row += len(chunk)
 
     pool.close()
     pool.join()
+
+    for r in pending:
+        r.get()  # raises WorkerLostError / exception if a worker was killed
 
     print("All chunks have been processed and saved.", flush=True)
 

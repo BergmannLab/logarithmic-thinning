@@ -12,7 +12,7 @@
 #   - For each input file matching <bgenie_dir>/<glob>, derives the list of
 #     phenotype columns from the header (every column name matching
 #     <col_pattern>, default = every '-log10p' column) and passes it to
-#     divide_and_conquer/sort.py as --pp-columns. The sort step writes
+#     sort_merge/sort.py as --pp-columns. The sort step writes
 #     sorted .npz chunks into <out_dir>/chunks/.
 #   - pmerge_sort.py then merges every chunk into <out_dir>/final_sorted_data.csv
 #     (plus a binary .npy).
@@ -79,7 +79,7 @@ for f in "${files[@]}"; do
   fi
   N=$(echo "$COLS" | tr ',' '\n' | wc -l)
   echo "[sort] $f  ($N phenotypes, chunksize=$CHUNK)"
-  python "$HERE/divide_and_conquer/sort.py" "$f" \
+  python "$HERE/sort_merge/sort.py" "$f" \
     --shared_dir "$CHUNKS" \
     --pp-columns "$COLS" \
     --pp-threshold 0 \
@@ -88,7 +88,7 @@ done
 
 # 2) merge all chunks -> $OUT/final_sorted_data.csv (+ .npy)
 echo "[merge]"
-python "$HERE/divide_and_conquer/pmerge_sort.py" \
+python "$HERE/sort_merge/pmerge_sort.py" \
   --input_dir "$CHUNKS" --output_dir "$OUT"
 
 # 3) logarithmic thinning -> $OUT/thinned_final_sorted_data.csv
