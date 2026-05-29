@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # SLURM variant of run_pipeline.sh.
 #
-# Submits a job array for the per-chromosome sort step, then a merge job
-# and a thin job, each depending on `afterok` of the previous stage. So if
-# any sort task fails, the merge and thin jobs are auto-cancelled.
+# Submits a job array for the per-chromosome sort step, then a single merge
+# job that depends on `afterok` of the sort array. The merge applies
+# logarithmic thinning inline, so there is no separate thin job; if any sort
+# task fails, the merge job is auto-cancelled.
 #
 # Usage:
 #   ./run_pipeline_slurm.sh <bgenie_dir> <out_dir> \
@@ -17,22 +18,22 @@
 #   slurm/inputs.txt          -- one input file path per line (array index)
 #   slurm/pp_columns.txt      -- the comma-separated --pp-columns list
 #   slurm/sort.sbatch         -- generated array job script
-#   slurm/merge.sbatch        -- generated merge job script
-#   slurm/thin.sbatch         -- generated thin job script
+#   slurm/merge.sbatch        -- generated merge (+ inline thin) job script
 #   slurm/logs/               -- per-job stdout/stderr
-#   final_sorted_data.csv     -- merge output
-#   thinned_final_sorted_data.csv  -- thin output
+#   thinned_final_sorted_data.csv  -- merge output (already thinned)
 #
 # Resources default to:
 #   sort  : 8 CPUs, 200G, 2h, partition=urblauna, account=<account>
-#   merge : 1 CPU,  96G,  6h
-#   thin  : 1 CPU,  100G, 1h
+#   merge : 1 CPU,  96G,  4h
 # Sort memory is generous because each worker pickles its full chunk
 # DataFrame (~5 GB for 500k rows × 1000 phenos × float32) and we may have
 # 3+ workers running in parallel on the largest chromosomes.
 # Merge is a single-process streaming k-way merge whose peak RAM is bounded by
 # --mem-budget-gb (set below), independent of total dataset size; 96G leaves
 # ample headroom over the 48G budget for memmap page cache and pandas overhead.
+# Thinning is fused into the merge: the globally-sorted stream is produced in
+# rank order, and only the logarithmically-spaced kept ranks are ever written,
+# so the merge emits ~tens of thousands of rows instead of a ~770 GB CSV.
 # Edit the SBATCH_* variables below to change them.
 set -euo pipefail
 
@@ -122,7 +123,7 @@ cat > "$SORT_SBATCH" <<EOF
 #!/usr/bin/env bash
 #SBATCH --account=$SBATCH_ACCOUNT
 #SBATCH --partition=$SBATCH_PARTITION
-#SBATCH --job-name=logthin-sort
+#SBATCH --job-name=bitcoin
 #SBATCH --output=$LOG_DIR/sort-%A_%a.out
 #SBATCH --error=$LOG_DIR/sort-%A_%a.err
 #SBATCH --nodes=1
@@ -150,14 +151,14 @@ cat > "$MERGE_SBATCH" <<EOF
 #!/usr/bin/env bash
 #SBATCH --account=$SBATCH_ACCOUNT
 #SBATCH --partition=$SBATCH_PARTITION
-#SBATCH --job-name=logthin-merge
+#SBATCH --job-name=bitcoin
 #SBATCH --output=$LOG_DIR/merge-%j.out
 #SBATCH --error=$LOG_DIR/merge-%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=96G
-#SBATCH --time=06:00:00
+#SBATCH --time=04:00:00
 set -euo pipefail
 $SBATCH_MODULES
 
@@ -165,45 +166,22 @@ echo "[\$(date -Is)] merge starting"
 python "$HERE/sort_merge/pmerge_sort.py" \\
   --input_dir "$CHUNKS" \\
   --output_dir "$OUT" \\
+  --thinning-factor $FACTOR \\
   --mem-budget-gb 48
 EOF
 
-THIN_SBATCH="$SLURM_DIR/thin.sbatch"
-cat > "$THIN_SBATCH" <<EOF
-#!/usr/bin/env bash
-#SBATCH --account=$SBATCH_ACCOUNT
-#SBATCH --partition=$SBATCH_PARTITION
-#SBATCH --job-name=logthin-thin
-#SBATCH --output=$LOG_DIR/thin-%j.out
-#SBATCH --error=$LOG_DIR/thin-%j.err
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=1
-#SBATCH --mem=100G
-#SBATCH --time=01:00:00
-set -euo pipefail
-$SBATCH_MODULES
-
-echo "[\$(date -Is)] thin starting"
-python "$HERE/thin_sorted_pvalues.py" "$OUT/final_sorted_data.csv" \\
-  --thinning-factor $FACTOR \\
-  --method python \\
-  --output "$OUT/thinned_final_sorted_data.csv"
-EOF
-
 # ---------------------------------------------------------------------------
-# Submit the DAG.
+# Submit the DAG. Thinning is fused into the merge, so there is no separate
+# thin job: the merge writes thinned_final_sorted_data.csv directly.
 # ---------------------------------------------------------------------------
 SORT_ID=$(sbatch --parsable --array=1-$N "$SORT_SBATCH")
 MERGE_ID=$(sbatch --parsable --dependency=afterok:$SORT_ID "$MERGE_SBATCH")
-THIN_ID=$(sbatch --parsable --dependency=afterok:$MERGE_ID "$THIN_SBATCH")
 
 echo
 echo "Submitted:"
 echo "  sort  : $SORT_ID (array 1-$N)"
-echo "  merge : $MERGE_ID (afterok:$SORT_ID)"
-echo "  thin  : $THIN_ID (afterok:$MERGE_ID)"
+echo "  merge : $MERGE_ID (afterok:$SORT_ID)  [merges + thins inline]"
 echo
 echo "Logs:    $LOG_DIR/"
-echo "Output:  $OUT/thinned_final_sorted_data.csv (once thin succeeds)"
-echo "Watch:   squeue -u \$USER -j $SORT_ID,$MERGE_ID,$THIN_ID"
+echo "Output:  $OUT/thinned_final_sorted_data.csv (once merge succeeds)"
+echo "Watch:   squeue -u \$USER -j $SORT_ID,$MERGE_ID"

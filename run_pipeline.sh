@@ -14,10 +14,10 @@
 #     <col_pattern>, default = every '-log10p' column) and passes it to
 #     sort_merge/sort.py as --pp-columns. The sort step writes
 #     sorted .npz chunks into <out_dir>/chunks/.
-#   - pmerge_sort.py then merges every chunk into <out_dir>/final_sorted_data.csv
-#     (plus a binary .npy).
-#   - thin_sorted_pvalues.py applies logarithmic thinning, writing
-#     <out_dir>/thinned_final_sorted_data.csv.
+#   - pmerge_sort.py then merges every chunk into a single globally-sorted
+#     stream and applies logarithmic thinning inline, writing only the kept
+#     rows to <out_dir>/thinned_final_sorted_data.csv. The full (unthinned)
+#     ordering is never materialised on disk.
 #
 # Notes:
 #   - Inputs are assumed space-delimited with `chr`/`pos` columns and one or
@@ -86,15 +86,10 @@ for f in "${files[@]}"; do
     --chunksize "$CHUNK"
 done
 
-# 2) merge all chunks -> $OUT/final_sorted_data.csv (+ .npy)
-echo "[merge]"
+# 2) merge all chunks, thinning inline -> $OUT/thinned_final_sorted_data.csv
+echo "[merge+thin]"
 python "$HERE/sort_merge/pmerge_sort.py" \
-  --input_dir "$CHUNKS" --output_dir "$OUT"
-
-# 3) logarithmic thinning -> $OUT/thinned_final_sorted_data.csv
-echo "[thin]"
-python "$HERE/thin_sorted_pvalues.py" "$OUT/final_sorted_data.csv" \
-  --thinning-factor "$FACTOR" --method python \
-  --output "$OUT/thinned_final_sorted_data.csv"
+  --input_dir "$CHUNKS" --output_dir "$OUT" \
+  --thinning-factor "$FACTOR"
 
 echo "Done -> $OUT/thinned_final_sorted_data.csv"

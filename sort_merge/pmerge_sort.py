@@ -39,6 +39,11 @@ from typing import List
 import numpy as np
 import pandas as pd
 
+# Reuse the single source of truth for the thinning rank-set so the fused merge
+# and the standalone thin_sorted_pvalues.py can never drift apart.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from thin_sorted_pvalues import UNTHINNED_COLUMN, logarithmic_thinning
+
 # Packed (unaligned) record: pp f32 + indices i32 + chr i16 + pos i32 = 14 bytes.
 RECORD_DTYPE = np.dtype(
     {
@@ -83,28 +88,53 @@ def _convert_to_memmap(npz_path: str, tmp_dir: str) -> str:
     return out_path
 
 
-def _emit_batch(batch: np.ndarray, csv_handle, write_header: bool) -> None:
-    """Sort a gathered batch descending by pp and append it to the CSV."""
+def _emit_selected(
+    batch: np.ndarray,
+    offset: int,
+    keep_ranks: np.ndarray,
+    csv_handle,
+) -> None:
+    """Sort a gathered batch descending by pp, then append only the rows whose
+    global 1-based rank falls in ``keep_ranks``.
+
+    The records in ``batch`` occupy global ranks ``(offset, offset + len(batch)]``
+    once sorted. ``keep_ranks`` is the ascending array of ranks to retain (the
+    logarithmic-thinning index set). Because each retained rank uniquely
+    identifies a sorted position, we never materialise the full sorted batch as
+    a DataFrame -- only the (typically tiny) selected subset is formatted and
+    written. This is what turns the merge from a ~770 GB CSV write into a few MB.
+    """
+    n = batch.shape[0]
+    lo = int(np.searchsorted(keep_ranks, offset + 1, side="left"))
+    hi = int(np.searchsorted(keep_ranks, offset + n, side="right"))
+    if hi <= lo:
+        return  # nothing in this block survives thinning
+
     order = np.argsort(-batch["pp"], kind="stable")
-    batch = batch[order]
+    sel_ranks = keep_ranks[lo:hi]
+    # sorted position of rank r is (r - offset - 1); map back to the original
+    # row in batch via the argsort order.
+    sel = batch[order[sel_ranks - offset - 1]]
     df = pd.DataFrame(
         {
-            "chr": batch["chr"],
-            "pos": batch["pos"],
-            "pp": batch["pp"],
-            "original_index": batch["indices"],
+            "chr": sel["chr"],
+            "pos": sel["pos"],
+            "pp": sel["pp"],
+            "original_index": sel["indices"],
+            UNTHINNED_COLUMN: sel_ranks,
         }
     )
-    df.to_csv(csv_handle, header=write_header, index=False)
+    df.to_csv(csv_handle, header=False, index=False)
 
 
 def _stream_kway_merge(
-    memmaps: List[np.ndarray], csv_path: str, block: int
+    memmaps: List[np.ndarray], csv_path: str, block: int, keep_ranks: np.ndarray
 ) -> int:
-    """Single-pass k-way merge of sorted-descending memmaps into a CSV.
+    """Single-pass k-way merge of sorted-descending memmaps, thinned inline.
 
-    Each ``memmaps[k]`` is a structured array sorted descending by ``pp``.
-    Returns the total number of records written.
+    Each ``memmaps[k]`` is a structured array sorted descending by ``pp``. The
+    merge streams the globally-sorted order but only writes rows whose global
+    rank is in ``keep_ranks``; it returns the number of rows actually written.
 
     Invariant per iteration: we only emit records whose ``pp`` is >= ``t``,
     where ``t`` is the largest "block tail" among chunks that still have
@@ -117,9 +147,10 @@ def _stream_kway_merge(
     lengths = [m.shape[0] for m in memmaps]
     pos = [0] * k
 
-    total_written = 0
-    write_header = True
+    offset = 0  # global rank already passed (number of records consumed)
+    written = 0
     with open(csv_path, "w", buffering=1 << 20, newline="") as fh:
+        fh.write("chr,pos,pp,original_index," + UNTHINNED_COLUMN + "\n")
         while True:
             active = [i for i in range(k) if pos[i] < lengths[i]]
             if not active:
@@ -155,22 +186,33 @@ def _stream_kway_merge(
                     pos[i] += count
 
             batch = parts[0] if len(parts) == 1 else np.concatenate(parts)
-            _emit_batch(batch, fh, write_header)
-            write_header = False
-            total_written += batch.shape[0]
+            before = offset + batch.shape[0]
+            lo = int(np.searchsorted(keep_ranks, offset + 1, side="left"))
+            hi = int(np.searchsorted(keep_ranks, before, side="right"))
+            _emit_selected(batch, offset, keep_ranks, fh)
+            written += hi - lo
+            offset = before
 
-    return total_written
+    return written
 
 
 def merge_chunks(
     input_files,
     output_dir,
+    thinning_factor=1.0003,
     n_workers=None,  # accepted for CLI/back-compat; merge is single-process
     tmp_dir=None,
     mem_budget_gb=50.0,
     keep_temp=False,
 ):
-    """Merge sorted ``.npz`` chunks into ``output_dir/final_sorted_data.csv``."""
+    """Merge sorted ``.npz`` chunks, thin inline, write thinned CSV.
+
+    The merge streams the globally-sorted order but only writes the rows kept by
+    logarithmic thinning (factor ``thinning_factor``), producing
+    ``output_dir/thinned_final_sorted_data.csv`` directly. The full
+    fully-expanded ordering (~10^10 rows) is never written to disk, since the
+    downstream thin step would discard all but a few tens of thousands of rows.
+    """
     input_files = list(input_files)
     if not input_files:
         raise ValueError("No input chunk files to merge.")
@@ -199,11 +241,18 @@ def merge_chunks(
 
     memmaps = [np.load(p, mmap_mode="r") for p in mm_paths]
 
-    csv_path = os.path.join(output_dir, "final_sorted_data.csv")
+    # The thinning rank-set depends only on the total record count, which is the
+    # sum of chunk lengths -- known before we merge a single record.
+    total_rows = int(sum(m.shape[0] for m in memmaps))
+    keep_ranks = np.asarray(
+        logarithmic_thinning(total_rows, thinning_factor), dtype=np.int64
+    )
+
+    csv_path = os.path.join(output_dir, "thinned_final_sorted_data.csv")
     t1 = time.time()
-    total = _stream_kway_merge(memmaps, csv_path, block)
+    total = _stream_kway_merge(memmaps, csv_path, block, keep_ranks)
     print(
-        f"Wrote {total:,} sorted records to {csv_path} in {time.time() - t1:.1f}s.",
+        f"Wrote {total:,} thinned records to {csv_path} in {time.time() - t1:.1f}s.",
         flush=True,
     )
 
@@ -223,9 +272,17 @@ def merge_chunks(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Streaming k-way merge of sorted chunks.")
+    parser = argparse.ArgumentParser(
+        description="Streaming k-way merge of sorted chunks with inline logarithmic thinning."
+    )
     parser.add_argument("--input_dir", required=True, help="Directory containing sorted chunk .npz files.")
-    parser.add_argument("--output_dir", required=True, help="Directory to save final_sorted_data.csv.")
+    parser.add_argument("--output_dir", required=True, help="Directory to save thinned_final_sorted_data.csv.")
+    parser.add_argument(
+        "--thinning-factor",
+        type=float,
+        default=1.0003,
+        help="Logarithmic thinning factor applied inline during the merge (default: 1.0003).",
+    )
     parser.add_argument(
         "--workers",
         type=int,
@@ -263,6 +320,7 @@ def main() -> None:
     merge_chunks(
         input_files,
         args.output_dir,
+        thinning_factor=args.thinning_factor,
         n_workers=args.workers,
         tmp_dir=args.tmp_dir,
         mem_budget_gb=args.mem_budget_gb,
