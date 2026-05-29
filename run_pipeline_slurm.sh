@@ -25,11 +25,14 @@
 #
 # Resources default to:
 #   sort  : 8 CPUs, 200G, 2h, partition=urblauna, account=<account>
-#   merge : 2 CPUs, 400G, 6h
+#   merge : 1 CPU,  96G,  6h
 #   thin  : 1 CPU,  100G, 1h
 # Sort memory is generous because each worker pickles its full chunk
 # DataFrame (~5 GB for 500k rows × 1000 phenos × float32) and we may have
 # 3+ workers running in parallel on the largest chromosomes.
+# Merge is a single-process streaming k-way merge whose peak RAM is bounded by
+# --mem-budget-gb (set below), independent of total dataset size; 96G leaves
+# ample headroom over the 48G budget for memmap page cache and pandas overhead.
 # Edit the SBATCH_* variables below to change them.
 set -euo pipefail
 
@@ -152,8 +155,8 @@ cat > "$MERGE_SBATCH" <<EOF
 #SBATCH --error=$LOG_DIR/merge-%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=2
-#SBATCH --mem=400G
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=96G
 #SBATCH --time=06:00:00
 set -euo pipefail
 $SBATCH_MODULES
@@ -162,7 +165,7 @@ echo "[\$(date -Is)] merge starting"
 python "$HERE/sort_merge/pmerge_sort.py" \\
   --input_dir "$CHUNKS" \\
   --output_dir "$OUT" \\
-  --workers \$SLURM_CPUS_PER_TASK
+  --mem-budget-gb 48
 EOF
 
 THIN_SBATCH="$SLURM_DIR/thin.sbatch"
