@@ -123,7 +123,7 @@ cat > "$SORT_SBATCH" <<EOF
 #!/usr/bin/env bash
 #SBATCH --account=$SBATCH_ACCOUNT
 #SBATCH --partition=$SBATCH_PARTITION
-#SBATCH --job-name=bitcoin
+#SBATCH --job-name=logthin-sort
 #SBATCH --output=$LOG_DIR/sort-%A_%a.out
 #SBATCH --error=$LOG_DIR/sort-%A_%a.err
 #SBATCH --nodes=1
@@ -151,7 +151,7 @@ cat > "$MERGE_SBATCH" <<EOF
 #!/usr/bin/env bash
 #SBATCH --account=$SBATCH_ACCOUNT
 #SBATCH --partition=$SBATCH_PARTITION
-#SBATCH --job-name=bitcoin
+#SBATCH --job-name=logthin-merge
 #SBATCH --output=$LOG_DIR/merge-%j.out
 #SBATCH --error=$LOG_DIR/merge-%j.err
 #SBATCH --nodes=1
