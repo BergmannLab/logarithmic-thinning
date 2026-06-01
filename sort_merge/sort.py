@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
-from typing import Iterable, List, Sequence
+from typing import Iterable, List, Sequence, Tuple
 
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed, BrokenExecutor
@@ -41,6 +42,58 @@ def _split_columns(value: str | None) -> List[str]:
     if not value:
         return []
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def parse_group_spec(value: str | None) -> List[Tuple[str, "re.Pattern[str]"]]:
+    """Parse a ``--groups`` spec of comma-separated ``name=regex`` pairs.
+
+    Returns an ordered list of ``(name, compiled_regex)``. Order matters: each
+    phenotype column is assigned to the *first* group whose regex matches it.
+    An empty/blank spec yields an empty list (single-group / legacy behaviour).
+    """
+    groups: List[Tuple[str, "re.Pattern[str]"]] = []
+    if not value:
+        return groups
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(
+                f"Invalid --groups entry {item!r}; expected 'name=regex'."
+            )
+        name, pattern = item.split("=", 1)
+        name = name.strip()
+        pattern = pattern.strip()
+        if not name or not pattern:
+            raise ValueError(
+                f"Invalid --groups entry {item!r}; both name and regex are required."
+            )
+        groups.append((name, re.compile(pattern)))
+    return groups
+
+
+def classify_columns(
+    columns: Sequence[str], groups: Sequence[Tuple[str, "re.Pattern[str]"]]
+) -> List[int]:
+    """Map each phenotype column to a 0-based group id (first matching group).
+
+    Raises if any column matches no group, so a typo in ``--groups`` or an
+    unexpected phenotype fails loudly before any chunk is written.
+    """
+    group_ids: List[int] = []
+    for col in columns:
+        for gid, (_name, pattern) in enumerate(groups):
+            if pattern.search(col):
+                group_ids.append(gid)
+                break
+        else:
+            names = ", ".join(name for name, _ in groups)
+            raise ValueError(
+                f"Phenotype column {col!r} matches none of the groups [{names}]. "
+                "Add a group that covers it or fix the --groups spec."
+            )
+    return group_ids
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -90,6 +143,17 @@ def parse_arguments() -> argparse.Namespace:
         help="Auto-detect columns ending with 'true-log10p' when --pp-columns is omitted.",
     )
     parser.add_argument(
+        "--groups",
+        default="",
+        help=(
+            "Comma-separated 'name=regex' pairs partitioning phenotype columns "
+            "into independently-thinned groups (e.g. "
+            "'dTIF=_pred,mTIF=_true,LV=^LV_'). Each column is assigned to the "
+            "first matching group; a column matching none is an error. "
+            "Omit for a single global group (legacy behaviour)."
+        ),
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=None,
@@ -113,6 +177,9 @@ class SortConfig:
     pp_columns: Sequence[str]
     p_columns: Sequence[str]
     threshold: float
+    # 0-based group id per phenotype column, in the concatenated order
+    # (pp_columns first, then p_columns). Empty => single group (all id 0).
+    group_ids: Sequence[int] = ()
 
 
 def auto_detect_pp_columns(path: str, delimiter: str) -> List[str]:
@@ -153,6 +220,16 @@ def process_chunk(args: tuple[pd.DataFrame, int, SortConfig]) -> str:
 
     combined_pp = pp_matrix.flatten(order="F")
 
+    # Group label per phenotype column, broadcast to one entry per flattened
+    # element. The column-major flatten lays out all n_rows of column 0, then
+    # column 1, ...; np.repeat matches that layout (element j has column j //
+    # n_rows). Empty group_ids => a single group (id 0).
+    if config.group_ids:
+        col_groups = np.asarray(config.group_ids, dtype=np.int8)
+    else:
+        col_groups = np.zeros(n_cols, dtype=np.int8)
+    group_values = np.repeat(col_groups, n_rows)
+
     row_indices = np.tile(
         np.arange(start_row, start_row + n_rows, dtype=np.int32), n_cols
     )
@@ -172,6 +249,7 @@ def process_chunk(args: tuple[pd.DataFrame, int, SortConfig]) -> str:
     filtered_row_indices = row_indices[mask]
     filtered_chr = chr_values[mask]
     filtered_pos = pos_values[mask]
+    filtered_grp = group_values[mask]
 
     if filtered_pp.size == 0:
         print("Chunk produced no values above threshold; skipping write.", flush=True)
@@ -182,12 +260,14 @@ def process_chunk(args: tuple[pd.DataFrame, int, SortConfig]) -> str:
     sorted_row_indices = filtered_row_indices[sorted_indices].astype(np.int32)
     sorted_chr = filtered_chr[sorted_indices]
     sorted_pos = filtered_pos[sorted_indices]
+    sorted_grp = filtered_grp[sorted_indices].astype(np.int8)
 
     assert (
         len(sorted_pp)
         == len(sorted_row_indices)
         == len(sorted_chr)
         == len(sorted_pos)
+        == len(sorted_grp)
     ), "Mismatch in data size after filtering and sorting"
 
     unique_id = f"{time.time_ns()}_{os.getpid()}"
@@ -198,6 +278,7 @@ def process_chunk(args: tuple[pd.DataFrame, int, SortConfig]) -> str:
         indices=sorted_row_indices,
         chr=sorted_chr.astype(np.int16),
         pos=sorted_pos.astype(np.int32),
+        grp=sorted_grp,
     )
     print(f"Saved chunk to {chunk_filename}", flush=True)
     return chunk_filename
@@ -237,6 +318,23 @@ def main() -> None:
     print(f"Using up to {n_workers} worker processes.", flush=True)
     print(f"Input file: {args.input_file}", flush=True)
 
+    # Assign each phenotype column to an independently-thinned group. Columns are
+    # ordered pp_columns first, then p_columns, matching the np.concatenate order
+    # in process_chunk. Empty --groups => a single global group (legacy).
+    groups = parse_group_spec(args.groups)
+    if groups:
+        group_ids = classify_columns([*pp_columns, *p_columns], groups)
+        counts = [0] * len(groups)
+        for gid in group_ids:
+            counts[gid] += 1
+        print(
+            "Phenotype groups: "
+            + ", ".join(f"{name}={counts[g]}" for g, (name, _) in enumerate(groups)),
+            flush=True,
+        )
+    else:
+        group_ids = []
+
     requested_columns: List[str] = [
         args.chr_column,
         args.pos_column,
@@ -267,6 +365,7 @@ def main() -> None:
         pp_columns=pp_columns,
         p_columns=p_columns,
         threshold=float(args.pp_threshold),
+        group_ids=tuple(group_ids),
     )
 
     # ProcessPoolExecutor.as_completed raises BrokenProcessPool when a child

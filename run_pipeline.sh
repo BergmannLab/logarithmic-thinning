@@ -6,7 +6,8 @@
 #                     [thinning_factor=1.0003] \
 #                     [glob='*'] \
 #                     [chunksize=500000] \
-#                     [col_pattern='-log10p$']
+#                     [col_pattern='-log10p$'] \
+#                     [groups='dTIF=_pred,mTIF=_true,LV=^LV_']
 #
 # Behaviour:
 #   - For each input file matching <bgenie_dir>/<glob>, derives the list of
@@ -14,9 +15,15 @@
 #     <col_pattern>, default = every '-log10p' column) and passes it to
 #     sort_merge/sort.py as --pp-columns. The sort step writes
 #     sorted .npz chunks into <out_dir>/chunks/.
+#   - Phenotype columns are partitioned into independently-thinned groups by the
+#     <groups> spec (comma-separated 'name=regex' pairs; each column joins the
+#     first group whose regex matches it, a column matching none is an error).
+#     The default groups dTIFs (_pred), mTIFs (_true) and LVs (^LV_). Pass an
+#     empty string ('') to thin all columns together as one group.
 #   - pmerge_sort.py then merges every chunk into a single globally-sorted
-#     stream and applies logarithmic thinning inline, writing only the kept
-#     rows to <out_dir>/thinned_final_sorted_data.csv. The full (unthinned)
+#     stream and applies logarithmic thinning inline *per group*, writing only
+#     the kept rows to <out_dir>/thinned_final_sorted_data_<group>.csv (or
+#     thinned_final_sorted_data.csv when ungrouped). The full (unthinned)
 #     ordering is never materialised on disk.
 #
 # Notes:
@@ -45,6 +52,9 @@ GLOB="${4:-*}"
 CHUNK="${5:-500000}"
 PATTERN="${6:-}"
 [ -z "$PATTERN" ] && PATTERN='-log10p$'
+# 7th arg may be '' to disable grouping; only fall back to the default when the
+# arg is entirely absent ('-' guard) rather than an explicit empty string.
+GROUP_SPEC="${7-dTIF=_pred,mTIF=_true,LV=^LV_}"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CHUNKS="$OUT/chunks"
@@ -78,18 +88,24 @@ for f in "${files[@]}"; do
     echo "ERROR: no header column matches /$PATTERN/ in $f" >&2; exit 1
   fi
   N=$(echo "$COLS" | tr ',' '\n' | wc -l)
-  echo "[sort] $f  ($N phenotypes, chunksize=$CHUNK)"
+  echo "[sort] $f  ($N phenotypes, chunksize=$CHUNK, groups='${GROUP_SPEC:-<none>}')"
   python "$HERE/sort_merge/sort.py" "$f" \
     --shared_dir "$CHUNKS" \
     --pp-columns "$COLS" \
     --pp-threshold 0 \
-    --chunksize "$CHUNK"
+    --chunksize "$CHUNK" \
+    --groups "$GROUP_SPEC"
 done
 
-# 2) merge all chunks, thinning inline -> $OUT/thinned_final_sorted_data.csv
+# 2) merge all chunks, thinning inline per group -> $OUT/thinned_final_sorted_data*.csv
 echo "[merge+thin]"
 python "$HERE/sort_merge/pmerge_sort.py" \
   --input_dir "$CHUNKS" --output_dir "$OUT" \
-  --thinning-factor "$FACTOR"
+  --thinning-factor "$FACTOR" \
+  --groups "$GROUP_SPEC"
 
-echo "Done -> $OUT/thinned_final_sorted_data.csv"
+if [ -n "$GROUP_SPEC" ]; then
+  echo "Done -> $OUT/thinned_final_sorted_data_<group>.csv"
+else
+  echo "Done -> $OUT/thinned_final_sorted_data.csv"
+fi
