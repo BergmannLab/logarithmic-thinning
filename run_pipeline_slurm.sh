@@ -11,7 +11,14 @@
 #                           [thinning_factor=1.0003] \
 #                           [glob='*'] \
 #                           [chunksize=500000] \
-#                           [col_pattern='-log10p$']
+#                           [col_pattern='-log10p$'] \
+#                           [groups='dTIF=_pred,mTIF=_true,LV=^LV_']
+#
+# Phenotype columns are partitioned into independently-thinned groups by the
+# <groups> spec (comma-separated 'name=regex' pairs; each column joins the first
+# group whose regex matches, a column matching none aborts the sort task). The
+# default groups dTIFs (_pred), mTIFs (_true) and LVs (^LV_); pass '' to thin
+# all columns together.
 #
 # Layout written under <out_dir>:
 #   chunks/                   -- intermediate .npz chunks (one per sort task)
@@ -20,7 +27,9 @@
 #   slurm/sort.sbatch         -- generated array job script
 #   slurm/merge.sbatch        -- generated merge (+ inline thin) job script
 #   slurm/logs/               -- per-job stdout/stderr
-#   thinned_final_sorted_data.csv  -- merge output (already thinned)
+#   thinned_final_sorted_data_<group>.csv  -- one thinned output per group
+#                                             (thinned_final_sorted_data.csv when
+#                                             ungrouped)
 #
 # Resources default to:
 #   sort  : 8 CPUs, 200G, 2h, partition=urblauna, account=<account>
@@ -44,6 +53,9 @@ GLOB="${4:-*}"
 CHUNK="${5:-500000}"
 PATTERN="${6:-}"
 [ -z "$PATTERN" ] && PATTERN='-log10p$'
+# 7th arg may be '' to disable grouping; only fall back to the default when the
+# arg is entirely absent rather than an explicit empty string.
+GROUP_SPEC="${7-dTIF=_pred,mTIF=_true,LV=^LV_}"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 OUT="$(cd "$(dirname "$OUT")" && pwd)/$(basename "$OUT")"  # absolutise
@@ -109,6 +121,7 @@ printf '%s\n' "$PP_COLS" > "$COLS_FILE"
 echo "Submitting SLURM pipeline:"
 echo "  inputs       : $N file(s)"
 echo "  phenotypes   : $N_COLS column(s) matching /$PATTERN/"
+echo "  groups       : ${GROUP_SPEC:-<none, single output>}"
 echo "  chunks dir   : $CHUNKS"
 echo "  slurm dir    : $SLURM_DIR"
 
@@ -143,6 +156,7 @@ python "$HERE/sort_merge/sort.py" "\$FILE" \\
   --pp-columns "\$COLS" \\
   --pp-threshold 0 \\
   --chunksize $CHUNK \\
+  --groups "$GROUP_SPEC" \\
   --workers \$SLURM_CPUS_PER_TASK
 EOF
 
@@ -167,6 +181,7 @@ python "$HERE/sort_merge/pmerge_sort.py" \\
   --input_dir "$CHUNKS" \\
   --output_dir "$OUT" \\
   --thinning-factor $FACTOR \\
+  --groups "$GROUP_SPEC" \\
   --mem-budget-gb 48
 EOF
 
@@ -183,5 +198,9 @@ echo "  sort  : $SORT_ID (array 1-$N)"
 echo "  merge : $MERGE_ID (afterok:$SORT_ID)  [merges + thins inline]"
 echo
 echo "Logs:    $LOG_DIR/"
-echo "Output:  $OUT/thinned_final_sorted_data.csv (once merge succeeds)"
+if [ -n "$GROUP_SPEC" ]; then
+  echo "Output:  $OUT/thinned_final_sorted_data_<group>.csv (one per group, once merge succeeds)"
+else
+  echo "Output:  $OUT/thinned_final_sorted_data.csv (once merge succeeds)"
+fi
 echo "Watch:   squeue -u \$USER -j $SORT_ID,$MERGE_ID"

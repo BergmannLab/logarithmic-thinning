@@ -43,12 +43,22 @@ import pandas as pd
 # and the standalone thin_sorted_pvalues.py can never drift apart.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from thin_sorted_pvalues import UNTHINNED_COLUMN, logarithmic_thinning
+from sort_merge.sort import parse_group_spec
 
-# Packed (unaligned) record: pp f32 + indices i32 + chr i16 + pos i32 = 14 bytes.
+
+def _output_name(group_name: str) -> str:
+    """CSV filename for a group ('' => the single ungrouped output)."""
+    if group_name:
+        return f"thinned_final_sorted_data_{group_name}.csv"
+    return "thinned_final_sorted_data.csv"
+
+# Packed (unaligned) record: pp f32 + indices i32 + chr i16 + pos i32 + grp i8
+# = 15 bytes. ``grp`` is the 0-based id of the independently-thinned phenotype
+# group (always 0 when no grouping was requested at sort time).
 RECORD_DTYPE = np.dtype(
     {
-        "names": ["pp", "indices", "chr", "pos"],
-        "formats": [np.float32, np.int32, np.int16, np.int32],
+        "names": ["pp", "indices", "chr", "pos", "grp"],
+        "formats": [np.float32, np.int32, np.int16, np.int32, np.int8],
     },
     align=False,
 )
@@ -64,11 +74,15 @@ _BYTES_PER_RECORD_PEAK = 64
 _MAX_BLOCK = 50_000_000
 
 
-def _convert_to_memmap(npz_path: str, tmp_dir: str) -> str:
+def _convert_to_memmap(npz_path: str, tmp_dir: str, n_groups: int):
     """Load a compressed sorted chunk and rewrite it as a memmappable .npy.
 
-    Returns the path to the structured ``.npy`` (sorted descending by pp, same
-    order as the input). Peak memory is one chunk.
+    Returns ``(out_path, group_counts)`` where ``out_path`` is the structured
+    ``.npy`` (sorted descending by pp, same order as the input) and
+    ``group_counts`` is an int64 array of length ``n_groups`` counting records
+    per group in this chunk (so the merge knows each group's total before
+    streaming). Chunks written before grouping existed have no ``grp`` field and
+    are treated as all group 0. Peak memory is one chunk.
     """
     data = np.load(npz_path)
     pp = data["pp"]
@@ -79,42 +93,22 @@ def _convert_to_memmap(npz_path: str, tmp_dir: str) -> str:
     rec["indices"] = data["indices"]
     rec["chr"] = data["chr"]
     rec["pos"] = data["pos"]
+    if "grp" in data.files:
+        rec["grp"] = data["grp"]
+    else:
+        rec["grp"] = 0
+    group_counts = np.bincount(rec["grp"], minlength=n_groups).astype(np.int64)
     del data, pp
 
     base = os.path.splitext(os.path.basename(npz_path))[0]
     out_path = os.path.join(tmp_dir, f"{base}.mm.npy")
     np.save(out_path, rec)
     del rec
-    return out_path
+    return out_path, group_counts
 
 
-def _emit_selected(
-    batch: np.ndarray,
-    offset: int,
-    keep_ranks: np.ndarray,
-    csv_handle,
-) -> None:
-    """Sort a gathered batch descending by pp, then append only the rows whose
-    global 1-based rank falls in ``keep_ranks``.
-
-    The records in ``batch`` occupy global ranks ``(offset, offset + len(batch)]``
-    once sorted. ``keep_ranks`` is the ascending array of ranks to retain (the
-    logarithmic-thinning index set). Because each retained rank uniquely
-    identifies a sorted position, we never materialise the full sorted batch as
-    a DataFrame -- only the (typically tiny) selected subset is formatted and
-    written. This is what turns the merge from a ~770 GB CSV write into a few MB.
-    """
-    n = batch.shape[0]
-    lo = int(np.searchsorted(keep_ranks, offset + 1, side="left"))
-    hi = int(np.searchsorted(keep_ranks, offset + n, side="right"))
-    if hi <= lo:
-        return  # nothing in this block survives thinning
-
-    order = np.argsort(-batch["pp"], kind="stable")
-    sel_ranks = keep_ranks[lo:hi]
-    # sorted position of rank r is (r - offset - 1); map back to the original
-    # row in batch via the argsort order.
-    sel = batch[order[sel_ranks - offset - 1]]
+def _write_rows(csv_handle, sel: np.ndarray, sel_ranks: np.ndarray) -> None:
+    """Append the selected records to one group's CSV (no header)."""
     df = pd.DataFrame(
         {
             "chr": sel["chr"],
@@ -127,30 +121,93 @@ def _emit_selected(
     df.to_csv(csv_handle, header=False, index=False)
 
 
+def _emit_groups(
+    batch: np.ndarray,
+    group_offset: np.ndarray,
+    keep_ranks_list: List[np.ndarray],
+    handles: List,
+    written: List[int],
+) -> None:
+    """Sort a gathered batch descending by pp, then append -- per group -- only
+    the rows whose *within-group* 1-based rank falls in that group's keep set.
+
+    ``group_offset[g]`` is the number of group-g records already emitted (their
+    rank base) and is advanced in place. Since the global stream is descending
+    in pp, each group's records form a descending subsequence, so the records of
+    group ``g`` in this sorted batch occupy within-group ranks
+    ``(group_offset[g], group_offset[g] + count_g]``. Each retained rank uniquely
+    identifies a position, so only the (tiny) selected subset is ever formatted.
+    """
+    n = batch.shape[0]
+    order = np.argsort(-batch["pp"], kind="stable")
+    n_groups = len(handles)
+
+    if n_groups == 1:
+        # Fast path: every record is group 0; sorted positions are 0..n-1.
+        kr = keep_ranks_list[0]
+        base = int(group_offset[0])
+        lo = int(np.searchsorted(kr, base + 1, side="left"))
+        hi = int(np.searchsorted(kr, base + n, side="right"))
+        if hi > lo:
+            sel_ranks = kr[lo:hi]
+            sel = batch[order[sel_ranks - base - 1]]
+            _write_rows(handles[0], sel, sel_ranks)
+            written[0] += hi - lo
+        group_offset[0] += n
+        return
+
+    sorted_grp = batch["grp"][order]
+    for g in range(n_groups):
+        gpos = np.nonzero(sorted_grp == g)[0]  # ascending sorted positions
+        cnt = gpos.size
+        if cnt == 0:
+            continue
+        kr = keep_ranks_list[g]
+        base = int(group_offset[g])
+        lo = int(np.searchsorted(kr, base + 1, side="left"))
+        hi = int(np.searchsorted(kr, base + cnt, side="right"))
+        if hi > lo:
+            sel_ranks = kr[lo:hi]
+            # within-group rank r -> index (r - base - 1) into this group's
+            # sorted subsequence (gpos) -> sorted-batch position -> original row.
+            sel = batch[order[gpos[sel_ranks - base - 1]]]
+            _write_rows(handles[g], sel, sel_ranks)
+            written[g] += hi - lo
+        group_offset[g] += cnt
+
+
 def _stream_kway_merge(
-    memmaps: List[np.ndarray], csv_path: str, block: int, keep_ranks: np.ndarray
-) -> int:
+    memmaps: List[np.ndarray],
+    csv_paths: List[str],
+    block: int,
+    keep_ranks_list: List[np.ndarray],
+) -> List[int]:
     """Single-pass k-way merge of sorted-descending memmaps, thinned inline.
 
     Each ``memmaps[k]`` is a structured array sorted descending by ``pp``. The
-    merge streams the globally-sorted order but only writes rows whose global
-    rank is in ``keep_ranks``; it returns the number of rows actually written.
+    merge streams the globally-sorted order but only writes rows whose
+    within-group rank is in that group's ``keep_ranks_list`` entry, fanning out
+    to one CSV per group. Returns the number of rows written per group.
 
     Invariant per iteration: we only emit records whose ``pp`` is >= ``t``,
     where ``t`` is the largest "block tail" among chunks that still have
     unloaded data. Every unloaded record is strictly < ``t``, so the gathered
-    ``pp >= t`` records are guaranteed to be the next ones globally and can be
-    sorted among themselves and flushed. The chunk owning ``t`` always has its
-    whole loaded block emitted, guaranteeing forward progress.
+    ``pp >= t`` records are guaranteed to be the next ones globally (hence the
+    next within every group too) and can be sorted among themselves and flushed.
+    The chunk owning ``t`` always has its whole loaded block emitted,
+    guaranteeing forward progress.
     """
     k = len(memmaps)
+    n_groups = len(csv_paths)
     lengths = [m.shape[0] for m in memmaps]
     pos = [0] * k
 
-    offset = 0  # global rank already passed (number of records consumed)
-    written = 0
-    with open(csv_path, "w", buffering=1 << 20, newline="") as fh:
-        fh.write("chr,pos,pp,original_index," + UNTHINNED_COLUMN + "\n")
+    group_offset = np.zeros(n_groups, dtype=np.int64)
+    written = [0] * n_groups
+    handles = [open(p, "w", buffering=1 << 20, newline="") for p in csv_paths]
+    try:
+        for fh in handles:
+            fh.write("chr,pos,pp,original_index," + UNTHINNED_COLUMN + "\n")
         while True:
             active = [i for i in range(k) if pos[i] < lengths[i]]
             if not active:
@@ -186,12 +243,10 @@ def _stream_kway_merge(
                     pos[i] += count
 
             batch = parts[0] if len(parts) == 1 else np.concatenate(parts)
-            before = offset + batch.shape[0]
-            lo = int(np.searchsorted(keep_ranks, offset + 1, side="left"))
-            hi = int(np.searchsorted(keep_ranks, before, side="right"))
-            _emit_selected(batch, offset, keep_ranks, fh)
-            written += hi - lo
-            offset = before
+            _emit_groups(batch, group_offset, keep_ranks_list, handles, written)
+    finally:
+        for fh in handles:
+            fh.close()
 
     return written
 
@@ -204,18 +259,26 @@ def merge_chunks(
     tmp_dir=None,
     mem_budget_gb=50.0,
     keep_temp=False,
+    group_names=None,
 ):
-    """Merge sorted ``.npz`` chunks, thin inline, write thinned CSV.
+    """Merge sorted ``.npz`` chunks, thin inline, write thinned CSV(s).
 
     The merge streams the globally-sorted order but only writes the rows kept by
-    logarithmic thinning (factor ``thinning_factor``), producing
-    ``output_dir/thinned_final_sorted_data.csv`` directly. The full
-    fully-expanded ordering (~10^10 rows) is never written to disk, since the
-    downstream thin step would discard all but a few tens of thousands of rows.
+    logarithmic thinning (factor ``thinning_factor``). With ``group_names`` set
+    (an ordered list aligned with the ``grp`` ids written by ``sort.py``), each
+    group is thinned independently against its own record total and written to
+    ``output_dir/thinned_final_sorted_data_<name>.csv``. Without it, all records
+    form one group written to ``thinned_final_sorted_data.csv`` (legacy).
+    The full fully-expanded ordering (~10^10 rows) is never written to disk.
+
+    Returns the list of output CSV paths (one per group).
     """
     input_files = list(input_files)
     if not input_files:
         raise ValueError("No input chunk files to merge.")
+
+    names = list(group_names) if group_names else [""]
+    n_groups = len(names)
 
     os.makedirs(output_dir, exist_ok=True)
     if tmp_dir is None:
@@ -233,28 +296,39 @@ def merge_chunks(
 
     t0 = time.time()
     mm_paths = []
+    group_totals = np.zeros(n_groups, dtype=np.int64)
     for idx, f in enumerate(input_files, 1):
-        mm_paths.append(_convert_to_memmap(f, tmp_dir))
+        path, counts = _convert_to_memmap(f, tmp_dir, n_groups)
+        mm_paths.append(path)
+        group_totals += counts
         if idx % 10 == 0 or idx == k:
             print(f"  converted {idx}/{k} chunks to memmap", flush=True)
     print(f"Conversion done in {time.time() - t0:.1f}s.", flush=True)
 
     memmaps = [np.load(p, mmap_mode="r") for p in mm_paths]
 
-    # The thinning rank-set depends only on the total record count, which is the
-    # sum of chunk lengths -- known before we merge a single record.
-    total_rows = int(sum(m.shape[0] for m in memmaps))
-    keep_ranks = np.asarray(
-        logarithmic_thinning(total_rows, thinning_factor), dtype=np.int64
-    )
+    # The thinning rank-set for each group depends only on that group's record
+    # count -- the sum of per-chunk group counts, known before merging a record.
+    keep_ranks_list: List[np.ndarray] = []
+    for g, name in enumerate(names):
+        total = int(group_totals[g])
+        label = f" [{name}]" if name else ""
+        if total == 0:
+            print(f"Group{label or ' (all)'} has no records; writing header only.", flush=True)
+            keep_ranks_list.append(np.empty(0, dtype=np.int64))
+        else:
+            print(f"Thinning group{label or ' (all)'}: {total:,} records.", flush=True)
+            keep_ranks_list.append(
+                np.asarray(logarithmic_thinning(total, thinning_factor), dtype=np.int64)
+            )
 
-    csv_path = os.path.join(output_dir, "thinned_final_sorted_data.csv")
+    csv_paths = [os.path.join(output_dir, _output_name(name)) for name in names]
     t1 = time.time()
-    total = _stream_kway_merge(memmaps, csv_path, block, keep_ranks)
-    print(
-        f"Wrote {total:,} thinned records to {csv_path} in {time.time() - t1:.1f}s.",
-        flush=True,
-    )
+    written = _stream_kway_merge(memmaps, csv_paths, block, keep_ranks_list)
+    for name, path, w in zip(names, csv_paths, written):
+        label = f" [{name}]" if name else ""
+        print(f"Wrote {w:,} thinned records{label} to {path}.", flush=True)
+    print(f"Merge done in {time.time() - t1:.1f}s.", flush=True)
 
     del memmaps
     if not keep_temp:
@@ -268,7 +342,7 @@ def merge_chunks(
         except OSError:
             pass
 
-    return csv_path
+    return csv_paths
 
 
 def main() -> None:
@@ -305,7 +379,20 @@ def main() -> None:
         action="store_true",
         help="Keep the intermediate memmapped .npy files instead of deleting them.",
     )
+    parser.add_argument(
+        "--groups",
+        default="",
+        help=(
+            "Comma-separated 'name=regex' pairs (the SAME spec passed to "
+            "sort.py) identifying the independently-thinned phenotype groups. "
+            "Only the names and their order are used here (id = position); the "
+            "regexes are ignored. Each group is written to "
+            "thinned_final_sorted_data_<name>.csv. Omit for a single output."
+        ),
+    )
     args = parser.parse_args()
+
+    group_names = [name for name, _ in parse_group_spec(args.groups)]
 
     input_files = [
         os.path.join(args.input_dir, f)
@@ -325,6 +412,7 @@ def main() -> None:
         tmp_dir=args.tmp_dir,
         mem_budget_gb=args.mem_budget_gb,
         keep_temp=args.keep_temp,
+        group_names=group_names,
     )
 
 

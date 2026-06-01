@@ -12,7 +12,8 @@ distribution.
                   [thinning_factor=1.0003] \
                   [glob='*'] \
                   [chunksize=500000] \
-                  [col_pattern='-log10p$']
+                  [col_pattern='-log10p$'] \
+                  [groups='dTIF=_pred,mTIF=_true,LV=^LV_']
 ```
 
 Three stages chained:
@@ -44,6 +45,24 @@ Restricting the set of columns:
 | `LV_.*-log10p$`              | only LV columns                |
 | `(LV_.*\|.*_true)-log10p$`   | LVs + measured                 |
 
+### Independent thinning of phenotype subgroups
+
+By default the selected columns are partitioned into **independently-thinned
+groups**, each with its own rank-1 baseline and logarithmic ladder, written to a
+separate `thinned_final_sorted_data_<group>.csv`. The `groups` argument is a
+comma-separated list of `name=regex` pairs; each column joins the **first** group
+whose regex matches it (matched against the full column name), and a column
+matching **no** group aborts the run (catching typos).
+
+| `groups` value                          | result                                   |
+| --------------------------------------- | ---------------------------------------- |
+| `dTIF=_pred,mTIF=_true,LV=^LV_` *(default)* | three files: dTIFs, mTIFs, LVs        |
+| `''` (empty)                            | one pooled `thinned_final_sorted_data.csv` |
+
+The same `groups` spec must reach both stages; both `run_pipeline.sh` and the
+SLURM driver pass it through automatically. `unthinned_rank` in each output is
+the rank **within that group**.
+
 Memory of the sort step scales roughly as `chunksize × n_phenotypes × 4 bytes`.
 For ~1000 phenotypes, `chunksize=500000` keeps it around 2 GB resident; halve
 it if you OOM.
@@ -58,7 +77,9 @@ The BGenie outputs for the May-2026 left-eye revision live at:
 
 Each chromosome file is space-delimited and carries **1058 `*-log10p` phenotype
 columns**: 17 measured TIFs (`*_true-log10p`), 17 deep-TIFs (`*_pred-log10p`),
-and 1024 LVs (`LV_*-log10p`). To thin all of them in one go:
+and 1024 LVs (`LV_*-log10p`). These map exactly onto the three default groups
+(`mTIF` / `dTIF` / `LV`), so the default run thins each independently. To process
+all of them:
 
 ```bash
 # clone once on Urblauna
@@ -73,16 +94,19 @@ OUTPUT=/scratch/<user>/retina/GWAS/output/logthin_left_eye_2026_05_26
 ```
 
 The default `col_pattern` picks up every `-log10p` column, so this thins all
-1058 phenotypes. To restrict to the 17 measured TIFs only, append a 6th
-argument: `'_true-log10p$'`.
+1058 phenotypes, split into the three default groups (dTIFs, mTIFs, LVs) →
+`thinned_final_sorted_data_{dTIF,mTIF,LV}.csv`. To restrict to the 17 measured
+TIFs only, append a 6th argument: `'_true-log10p$'`. To thin everything together
+as a single pooled output, append `''` as the 7th argument to disable grouping.
 
 `run_pipeline.sh` runs the sort step serially across the 22 chromosomes on a
 single node — fine for a quick check, but on Urblauna prefer the SLURM driver
 below. Outputs (identical for both drivers):
 
 - `$OUTPUT/chunks/` — sorted `.npz` chunks (intermediate; can be deleted after)
-- `$OUTPUT/final_sorted_data.csv` (+ `.npy`) — fully sorted, untrimmed
-- `$OUTPUT/thinned_final_sorted_data.csv` — the final thinned table
+- `$OUTPUT/thinned_final_sorted_data_<group>.csv` — one thinned table per group
+  (or a single `thinned_final_sorted_data.csv` when grouping is disabled). The
+  full untrimmed ordering is never materialised on disk.
 
 ### SLURM (recommended on Urblauna)
 
