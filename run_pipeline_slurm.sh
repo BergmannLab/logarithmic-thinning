@@ -32,7 +32,8 @@
 #                                             ungrouped)
 #
 # Resources default to:
-#   sort  : 8 CPUs, 200G, 2h, partition=urblauna, account=<account>
+#   sort  : 8 CPUs, 200G, 2h  (account/partition from the environment,
+#                            see the site-configuration block below)
 #   merge : 1 CPU,  96G,  4h
 # Sort memory is generous because each worker pickles its full chunk
 # DataFrame (~5 GB for 500k rows × 1000 phenos × float32) and we may have
@@ -63,9 +64,36 @@ CHUNKS="$OUT/chunks"
 SLURM_DIR="$OUT/slurm"
 LOG_DIR="$SLURM_DIR/logs"
 
-SBATCH_ACCOUNT="<account>"
-SBATCH_PARTITION="urblauna"
-SBATCH_MODULES='source /dcsrsoft/spack/bin/setup_dcsrsoft && module load gcc python/3.8'
+# ---------------------------------------------------------------------------
+# Site configuration. Every value is empty by default and overridden from the
+# environment, so the driver runs on any SLURM cluster out of the box:
+#
+#   SBATCH_ACCOUNT=my_account SBATCH_PARTITION=my_partition ./run_pipeline_slurm.sh ...
+#
+# An empty value means "omit the directive" rather than "pass an empty one" --
+# clusters that need no account, or that have a default partition, need nothing
+# set. SBATCH_MODULES is any shell prologue the job must run before `python` is
+# on PATH (module loads, a venv activation, `pixi shell-hook`, ...).
+# ---------------------------------------------------------------------------
+SBATCH_ACCOUNT="${SBATCH_ACCOUNT:-}"
+SBATCH_PARTITION="${SBATCH_PARTITION:-}"
+SBATCH_MODULES="${SBATCH_MODULES:-}"
+
+# Assembled once; interpolated into both generated sbatch scripts. Each entry
+# carries its own trailing newline so an unset value leaves no blank line
+# between the shebang and the remaining directives.
+# `if` rather than `[ ... ] && ...`: this runs under `set -e`, where a bare test
+# that fails is the script's exit status and would abort the run whenever a value
+# is legitimately unset.
+SBATCH_SITE=""
+if [ -n "$SBATCH_ACCOUNT" ]; then
+  SBATCH_SITE="${SBATCH_SITE}#SBATCH --account=${SBATCH_ACCOUNT}
+"
+fi
+if [ -n "$SBATCH_PARTITION" ]; then
+  SBATCH_SITE="${SBATCH_SITE}#SBATCH --partition=${SBATCH_PARTITION}
+"
+fi
 
 [ -d "$IN" ] || { echo "ERROR: input dir does not exist: $IN" >&2; exit 1; }
 if [ -d "$CHUNKS" ] && [ -n "$(ls -A "$CHUNKS" 2>/dev/null)" ]; then
@@ -134,9 +162,7 @@ echo "  slurm dir    : $SLURM_DIR"
 SORT_SBATCH="$SLURM_DIR/sort.sbatch"
 cat > "$SORT_SBATCH" <<EOF
 #!/usr/bin/env bash
-#SBATCH --account=$SBATCH_ACCOUNT
-#SBATCH --partition=$SBATCH_PARTITION
-#SBATCH --job-name=logthin-sort
+${SBATCH_SITE}#SBATCH --job-name=logthin-sort
 #SBATCH --output=$LOG_DIR/sort-%A_%a.out
 #SBATCH --error=$LOG_DIR/sort-%A_%a.err
 #SBATCH --nodes=1
@@ -163,9 +189,7 @@ EOF
 MERGE_SBATCH="$SLURM_DIR/merge.sbatch"
 cat > "$MERGE_SBATCH" <<EOF
 #!/usr/bin/env bash
-#SBATCH --account=$SBATCH_ACCOUNT
-#SBATCH --partition=$SBATCH_PARTITION
-#SBATCH --job-name=logthin-merge
+${SBATCH_SITE}#SBATCH --job-name=logthin-merge
 #SBATCH --output=$LOG_DIR/merge-%j.out
 #SBATCH --error=$LOG_DIR/merge-%j.err
 #SBATCH --nodes=1

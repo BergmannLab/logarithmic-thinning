@@ -1,15 +1,4 @@
-#!/bin/python3
-#SBATCH --account=<account>
-#SBATCH --job-name=thin
-#SBATCH --error=slurm-%j.err
-#SBATCH --output=slurm-%j.out
-#SBATCH --nodes 1
-#SBATCH --ntasks 1
-#SBATCH --cpus-per-task 1
-#SBATCH --mem 100G
-#SBATCH --time 1:00:00
-#SBATCH --partition urblauna
-
+#!/usr/bin/env python3
 """
 Utility to apply logarithmic thinning to a pre-sorted table.
 Configuration defaults live at the top of the file for quick inspection.

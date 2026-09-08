@@ -115,5 +115,14 @@ def main():
     print(f"  grouped rows total = {grouped_total}, ungrouped = {ungrouped_total}")
 
 
+def test_group_thinning():
+    """pytest entry point.
+
+    The checks live in ``main()`` so the module stays runnable as a standalone script;
+    without a ``test_``-prefixed function pytest collects nothing from this file.
+    """
+    main()
+
+
 if __name__ == "__main__":
     main()

@@ -1,0 +1,20 @@
+# Python build artefacts (created by `pip install .` / `python -m build`)
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.py[cod]
+
+# Compiled C++ tools (built from cpp/ via its Makefile)
+cpp/build/
+cpp/*.o
+
+# Environments
+.venv/
+venv/
+
+# Test scratch
+.pytest_cache/
+
+# Internal notes, site configs and cluster-specific paths (never published)
+private/

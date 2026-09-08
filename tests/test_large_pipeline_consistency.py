@@ -46,6 +46,14 @@ CHROMOSOMES = tuple(CHROM_LENGTHS.keys())
 BACKGROUND_SNPS = 100_000
 THINNING_FACTOR = 1.002 # DEFAULT is 1.0003
 
+# This test compares the Python and C++ pipelines at TWO stages: the fully sorted table,
+# and then the thinned table. pmerge_sort fuses thinning into the merge and deliberately
+# never writes the full expanded ordering to disk, so to recover an unthinned sorted table
+# we exploit the thinning rule itself: every rank above `factor / (factor - 1)` is kept
+# unthinned, so a factor whose threshold exceeds the record count keeps everything.
+# 100 000 SNPs x 2 trait columns = 200 000 records; this threshold is ~250 000.
+UNTHINNED_MERGE_FACTOR = 1.000004
+
 PEAKS = [
     {"chrom": 3, "center_frac": 0.35, "height": 60.0, "decay": 1.2e6, "count": 140},
     {"chrom": 7, "center_frac": 0.55, "height": 45.0, "decay": 1.0e6, "count": 120},
@@ -167,10 +175,13 @@ def run_python_pipeline(chromosomes, tmpdir, threshold):
             str(combined_path),
             "--shared_dir",
             str(shared_dir),
-            "--pp_threshold",
+            "--pp-threshold",
             str(int(threshold)),
             "--chunksize",
             str(total_rows),
+            # sort.py requires the p-value columns to be named explicitly or detected;
+            # without this it exits 1 with "No p-value columns supplied".
+            "--auto-detect",
         ],
         cwd=REPO_ROOT,
         check=True,
@@ -184,12 +195,16 @@ def run_python_pipeline(chromosomes, tmpdir, threshold):
             str(shared_dir),
             "--output_dir",
             str(output_dir),
+            # Keep every row, so what follows is the fully sorted table (see
+            # UNTHINNED_MERGE_FACTOR); the thinning stage is exercised separately below.
+            "--thinning-factor",
+            repr(UNTHINNED_MERGE_FACTOR),
         ],
         cwd=REPO_ROOT,
         check=True,
     )
 
-    final_csv = output_dir / "final_sorted_data.csv"
+    final_csv = output_dir / "thinned_final_sorted_data.csv"
     df = pd.read_csv(final_csv)
     df = canonical_sort(df)
     df.to_csv(final_csv, index=False)

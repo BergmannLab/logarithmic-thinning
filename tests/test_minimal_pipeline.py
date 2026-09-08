@@ -69,7 +69,7 @@ def main():
             input_path = os.path.join(raw_dir, f"chr{chrom}.txt")
             write_bgenie_file(input_path, rows)
 
-            log10p_columns = sorter.get_log10p_columns(input_path)
+            log10p_columns = sorter.auto_detect_pp_columns(input_path, " ")
             chunk_df = pd.read_csv(
                 input_path,
                 sep=" ",
@@ -77,13 +77,25 @@ def main():
                 dtype={"chr": "int8", "pos": "int32", **{col: "float32" for col in log10p_columns}},
             )
 
-            task_args = (chunk_df, 0, shared_dir, log10p_columns, 0.0)
-            chunk_file = sorter.process_chunk(task_args)
+            # process_chunk takes (dataframe, start_row, SortConfig).
+            config = sorter.SortConfig(
+                shared_dir=shared_dir,
+                chr_column="chr",
+                pos_column="pos",
+                pp_columns=log10p_columns,
+                p_columns=(),
+                threshold=0.0,
+            )
+            chunk_file = sorter.process_chunk((chunk_df, 0, config))
             chunk_files.append(chunk_file)
 
-        merger.merge_chunks(chunk_files, output_dir)
+        # The merge fuses thinning in and never writes the full expanded ordering. This
+        # test checks the *sorted* result, so pick a factor whose unthinned-head
+        # threshold, factor/(factor - 1) ~ 2001, exceeds this tiny fixture's record
+        # count -- every row is then kept.
+        merger.merge_chunks(chunk_files, output_dir, thinning_factor=1.0005)
 
-        final_csv = os.path.join(output_dir, "final_sorted_data.csv")
+        final_csv = os.path.join(output_dir, "thinned_final_sorted_data.csv")
         final_df = pd.read_csv(final_csv)
 
         actual_records = final_df[["chr", "pos", "pp"]].to_dict("records")
@@ -103,6 +115,15 @@ def main():
         print("Minimal pipeline test passed. Final thinned records:")
         for record in thinned_records:
             print(record)
+
+
+def test_minimal_pipeline():
+    """pytest entry point.
+
+    The checks live in ``main()`` so the module stays runnable as a standalone script;
+    without a ``test_``-prefixed function pytest collects nothing from this file.
+    """
+    main()
 
 
 if __name__ == "__main__":

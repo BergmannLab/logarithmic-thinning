@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "logarithmic-thinning"
+version = "1.0.0"
+description = "Logarithmic thinning of sorted GWAS p-values: keep every top hit and a geometric sample of the rest."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+
+# MIT, deliberately permissive: this is a small general-purpose utility, and MIT keeps it
+# usable by anyone regardless of their own licence. It is also GPL-compatible, so the
+# GPL-3.0 analysis hub can depend on it without friction.
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+
+# The core library is deliberately DEPENDENCY-FREE. `thin_sorted_pvalues` imports only the
+# standard library (argparse, math, os, subprocess, tempfile, time, typing), so anything
+# that just needs the thinning ranks -- e.g. the MVP analysis hub -- installs nothing else
+# and has no transitive versions to worry about.
+dependencies = []
+
+[project.optional-dependencies]
+# The sort/merge pipeline (sort_merge/) is the part that actually needs a numerical stack.
+pipeline = [
+    "numpy>=1.20",
+    "pandas>=1.3",
+]
+dev = [
+    "pytest>=7.0",
+    "numpy>=1.20",
+    "pandas>=1.3",
+]
+
+[project.scripts]
+thin-sorted-pvalues = "thin_sorted_pvalues:main"
+
+[tool.setuptools]
+# Top-level modules kept where they are: run_pipeline.sh invokes them by path and the
+# tests import them by these names, so moving files would break both for no benefit.
+py-modules = [
+    "logarithmic_thinning",
+    "thin_sorted_pvalues",
+    "thin_sorted_pvalues_with_rows",
+]
+packages = ["sort_merge"]
